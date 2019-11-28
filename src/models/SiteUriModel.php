@@ -5,9 +5,11 @@
 
 namespace putyourlightson\blitz\models;
 
+use Craft;
 use craft\base\Model;
 use craft\helpers\UrlHelper;
 use putyourlightson\blitz\Blitz;
+use yii\base\Exception;
 
 /**
  * @property string $url
@@ -40,11 +42,17 @@ class SiteUriModel extends Model
     // =========================================================================
 
     /**
-     * Returns a URL.
+     * Returns the absolute URL.
      */
     public function getUrl(): string
     {
-        return UrlHelper::siteUrl($this->uri, null, null, $this->siteId);
+        $site = Craft::$app->getSites()->getSiteById($this->siteId);
+
+        if ($site === null) {
+            return '';
+        }
+
+        return $site->getBaseUrl().$this->uri;
     }
 
     /**

@@ -7,11 +7,18 @@ namespace putyourlightson\blitz\drivers\warmers;
 
 use Craft;
 use craft\helpers\App;
+use craft\helpers\UrlHelper;
 use craft\web\UrlManager;
 use craft\web\UrlRule;
+use Generator;
+use GuzzleHttp\Exception\GuzzleException;
+use GuzzleHttp\Pool;
+use GuzzleHttp\Psr7\Request;
 use putyourlightson\blitz\Blitz;
 use putyourlightson\blitz\helpers\CacheWarmerHelper;
+use putyourlightson\blitz\helpers\SiteUriHelper;
 use putyourlightson\blitz\models\SiteUriModel;
+use yii\base\Exception;
 
 /**
  * @property mixed $settingsHtml
@@ -35,28 +42,18 @@ class LocalWarmer extends BaseCacheWarmer
     /**
      * @inheritdoc
      */
-    public function canWarmConsoleRequest(): bool
-    {
-        return false;
-    }
-
-    /**
-     * @inheritdoc
-     */
     public function warmUris(array $siteUris, int $delay = null, callable $setProgressHandler = null)
     {
-        if (Craft::$app->getRequest()->getIsConsoleRequest()) {
-            $error = Craft::t('blitz', 'Cannot warm URIs from console command using Local Warmer (use the Guzzle Warmer instead).');
-            Blitz::$plugin->log($error, [], 'error');
-
-            return;
-        }
-
         if (!$this->beforeWarmCache($siteUris)) {
             return;
         }
 
-        CacheWarmerHelper::addWarmerJob($siteUris, 'warmUrisWithProgress', $delay);
+        if (Craft::$app->getRequest()->getIsConsoleRequest()) {
+            $this->warmUrisWithProgressForConsoleRequest($siteUris, $setProgressHandler);
+        }
+        else {
+            CacheWarmerHelper::addWarmerJob($siteUris, 'warmUrisWithProgress', $delay);
+        }
 
         $this->afterWarmCache($siteUris);
     }
@@ -73,20 +70,6 @@ class LocalWarmer extends BaseCacheWarmer
         $total = count($siteUris);
         $label = 'Warming {count} of {total} pages.';
 
-        /**
-         * Create component configs
-         * @see vendor/craftcms/cms/src/config/app.web.php
-         */
-        $componentConfigs = [
-            'request' => App::webRequestConfig(),
-            'response' => App::webResponseConfig(),
-            'urlManager' => [
-                'class' => UrlManager::class,
-                'enablePrettyUrl' => true,
-                'ruleConfig' => ['class' => UrlRule::class],
-            ]
-        ];
-
         foreach ($siteUris as $siteUri) {
             $count++;
 
@@ -100,12 +83,57 @@ class LocalWarmer extends BaseCacheWarmer
                 $siteUri = new SiteUriModel($siteUri);
             }
 
-            $this->_warmUri($siteUri, $componentConfigs);
+            $this->warmUri($siteUri);
         }
     }
 
-    // Private Methods
-    // =========================================================================
+    /**
+     * Warms site URIs with progress for a console request.
+     *
+     * @param SiteUriModel[] $siteUris
+     * @param callable|null $setProgressHandler
+     */
+    public function warmUrisWithProgressForConsoleRequest(array $siteUris, callable $setProgressHandler = null)
+    {
+        /**
+         * Empty params array is required because of Craft bug
+         * @see https://github.com/craftcms/cms/pull/5282
+         */
+        $route = ['blitz/local-warmer/warm-site-uri', []];
+
+        $token = Craft::$app->getTokens()->createToken($route);
+
+        $count = 0;
+        $total = count($siteUris);
+        $label = 'Warming {count} of {total} pages.';
+
+        $client = Craft::createGuzzleClient();
+
+        // Create a pool of requests for sending multiple concurrent requests
+        $pool = new Pool($client, $this->_getRequests($siteUris, $token), [
+            'fulfilled' => function() use (&$count, $total, $label, $setProgressHandler) {
+                $count++;
+
+                if (is_callable($setProgressHandler)) {
+                    $progressLabel = Craft::t('blitz', $label, ['count' => $count, 'total' => $total]);
+                    call_user_func($setProgressHandler, $count, $total, $progressLabel);
+                }
+            },
+            'rejected' => function(GuzzleException $reason) use (&$count, $total, $label, $setProgressHandler) {
+                $count++;
+
+                if (is_callable($setProgressHandler)) {
+                    $progressLabel = Craft::t('blitz', $label, ['count' => $count, 'total' => $total]);
+                    call_user_func($setProgressHandler, $count, $total, $progressLabel);
+                }
+
+                Blitz::$plugin->debug($reason->getMessage());
+            },
+        ]);
+
+        // Initiate the transfers and wait for the pool of requests to complete
+        $pool->promise()->wait();
+    }
 
     /**
      * Warms a site URI.
@@ -113,7 +141,7 @@ class LocalWarmer extends BaseCacheWarmer
      * @param SiteUriModel $siteUri
      * @param array $componentConfigs
      */
-    private function _warmUri(SiteUriModel $siteUri, array $componentConfigs)
+    public function warmUri(SiteUriModel $siteUri)
     {
         $url = $siteUri->getUrl();
 
@@ -132,14 +160,19 @@ class LocalWarmer extends BaseCacheWarmer
             'REQUEST_URI' => '/'.$uri,
             'QUERY_STRING' => 'p='.$uri,
         ]);
-        $_GET = array_merge($_GET, [
-            'p' => $uri,
-        ]);
+        $_GET = ['p' => $uri];
 
-        // Recreate components from configs
-        foreach ($componentConfigs as $id => $componentConfig) {
-            Craft::$app->set($id, $componentConfig);
-        }
+        /**
+         * Recreate component configs
+         * @see vendor/craftcms/cms/src/config/app.web.php
+         */
+        Craft::$app->set('request', App::webRequestConfig());
+        Craft::$app->set('response', App::webResponseConfig());
+        Craft::$app->set('urlManager', [
+            'class' => UrlManager::class,
+            'enablePrettyUrl' => true,
+            'ruleConfig' => ['class' => UrlRule::class],
+        ]);
 
         /**
          * Override the host info as it can be set unreliably
@@ -160,5 +193,31 @@ class LocalWarmer extends BaseCacheWarmer
         Craft::$app->trigger(Craft::$app::EVENT_BEFORE_REQUEST);
         Craft::$app->handleRequest(Craft::$app->getRequest());
         Craft::$app->trigger(Craft::$app::EVENT_AFTER_REQUEST);
+    }
+
+    // Private Methods
+    // =========================================================================
+
+    /**
+     * Returns a generator to return the URL requests in a memory efficient manner
+     * https://medium.com/tech-tajawal/use-memory-gently-with-yield-in-php-7e62e2480b8d
+     *
+     * @param array $siteUris
+     * @param string $token
+     *
+     * @return Generator
+     */
+    private function _getRequests(array $siteUris, string $token): Generator
+    {
+        /** @var SiteUriModel $siteUri */
+        foreach ($siteUris as $siteUri) {
+            $url = UrlHelper::siteUrl('actions/blitz/local-warmer/warm-site-uri', [
+                'siteId' => $siteUri->siteId,
+                'uri' => $siteUri->uri,
+                'token' => $token,
+            ]);
+
+            yield new Request('GET', $url);
+        }
     }
 }
