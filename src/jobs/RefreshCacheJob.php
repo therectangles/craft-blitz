@@ -17,6 +17,7 @@ use putyourlightson\blitz\helpers\ElementTypeHelper;
 use putyourlightson\blitz\helpers\SiteUriHelper;
 use putyourlightson\blitz\records\ElementQueryCacheRecord;
 use putyourlightson\blitz\records\ElementQueryRecord;
+use putyourlightson\logtofile\LogToFile;
 use Throwable;
 
 class RefreshCacheJob extends BaseJob
@@ -38,6 +39,17 @@ class RefreshCacheJob extends BaseJob
      * @var bool
      */
     public $clearCache = false;
+
+    /**
+     * @inheritdoc
+     */
+    public function init()
+    {
+        parent::init();
+
+        LogToFile::log(json_encode($this), 'blitz-debug');
+        LogToFile::log((new \Exception())->getTraceAsString(), 'blitz-debug');
+    }
 
     // Public Methods
     // =========================================================================
